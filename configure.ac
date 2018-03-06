@@ -2,8 +2,9 @@
 AC_INIT(libssh2, [-], libssh2-devel@cool.haxx.se)
 AC_CONFIG_MACRO_DIR([m4])
 AC_CONFIG_SRCDIR([src])
-AM_CONFIG_HEADER([src/libssh2_config.h example/libssh2_config.h])
+AC_CONFIG_HEADERS([src/libssh2_config.h example/libssh2_config.h])
 AM_MAINTAINER_MODE
+m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES([yes])])
 
 dnl SED is needed by some of the tools
 AC_PATH_PROG( SED, sed, sed-was-not-found-by-configure,
@@ -83,58 +84,84 @@ dnl check for how to do large files
 AC_SYS_LARGEFILE
 
 # Configure parameters
-AC_ARG_WITH(libgcrypt,
-  AC_HELP_STRING([--with-libgcrypt],[Use Libgcrypt for crypto]),
-  use_libgcrypt=$withval,use_libgcrypt=auto)
-AC_ARG_WITH(openssl,
-  AC_HELP_STRING([--with-openssl],[Use OpenSSL for crypto]),
-  use_openssl=$withval,use_openssl=auto)
-AC_ARG_WITH(libz,
-  AC_HELP_STRING([--with-libz],[Use Libz for compression]),
-  use_libz=$withval,use_libz=auto)
 
-# Look for OpenSSL (default)
-if test "$use_openssl" != "no" && test "$use_libgcrypt" != "yes"; then
-  AC_LIB_HAVE_LINKFLAGS([ssl], [crypto], [#include <openssl/ssl.h>])
-  LIBSREQUIRED=libssl,libcrypto
+
+# Crypto backends
+
+found_crypto=none
+found_crypto_str=""
+support_clear_memory=no
+crypto_errors=""
+
+m4_set_add([crypto_backends], [openssl])
+m4_set_add([crypto_backends], [libgcrypt])
+m4_set_add([crypto_backends], [mbedtls])
+m4_set_add([crypto_backends], [wincng])
+
+AC_ARG_WITH([crypto],
+  AC_HELP_STRING([--with-crypto=auto|]m4_set_contents([crypto_backends], [|]),
+    [Select crypto backend (default: auto)]),
+  use_crypto=$withval,
+  use_crypto=auto
+)
+
+case "${use_crypto}" in
+  auto|m4_set_contents([crypto_backends], [|]))
+    m4_set_map([crypto_backends], [LIBSSH2_CHECK_CRYPTO])
+    ;;
+  yes|"")
+    crypto_errors="No crypto backend specified!"
+    ;;
+  *)
+    crypto_errors="Unknown crypto backend '${use_crypto}' specified!"
+    ;;
+esac
+
+if test "$found_crypto" = "none"; then
+  crypto_errors="${crypto_errors}
+Specify --with-crypto=\$backend and/or the neccessary library search prefix.
+
+Known crypto backends: auto, m4_set_contents([crypto_backends], [, ])"
+  AS_MESSAGE([ERROR: ${crypto_errors}])
+else
+  test "$found_crypto_str" = "" && found_crypto_str="$found_crypto"
 fi
 
-# Look for libgcrypt
-if test "$ac_cv_libssl" != "yes" && test "$use_libgcrypt" != "no"; then
-  AC_LIB_HAVE_LINKFLAGS([gcrypt], [], [#include <gcrypt.h>])
-  LIBS="$LIBS -lgcrypt"
+m4_set_foreach([crypto_backends], [backend],
+  [AM_CONDITIONAL(m4_toupper(backend), test "$found_crypto" = "backend")]
+)
+m4_undefine([backend])
+
+
+# libz
+
+AC_ARG_WITH([libz],
+  AC_HELP_STRING([--with-libz],[Use libz for compression]),
+  use_libz=$withval,
+  use_libz=auto)
+
+found_libz=no
+libz_errors=""
+
+if test "$use_libz" != no; then
+  AC_LIB_HAVE_LINKFLAGS([z], [], [#include <zlib.h>])
+  if test "$ac_cv_libz" != yes; then
+    if test "$use_libz" = auto; then
+      AC_MSG_NOTICE([Cannot find libz, disabling compression])
+      found_libz="disabled; no libz found"
+    else
+      libz_errors="No libz found!
+Try --with-libz-prefix=PATH if you know that you have it."
+      AS_MESSAGE([ERROR: $libz_errors])
+    fi
+  else
+    AC_DEFINE(LIBSSH2_HAVE_ZLIB, 1, [Compile in zlib support])
+    LIBSREQUIRED="$LIBSREQUIRED${LIBSREQUIRED:+ }zlib"
+    found_libz="yes"
+  fi
 fi
 
 AC_SUBST(LIBSREQUIRED)
-
-if test "$ac_cv_libssl" != "yes" && test "$ac_cv_libgcrypt" != "yes"; then
-  AC_MSG_ERROR([cannot find OpenSSL or Libgcrypt,
-try --with-libssl-prefix=PATH or --with-libgcrypt-prefix=PATH])
-fi
-
-if test "$ac_cv_libgcrypt" = "yes"; then
-  AC_DEFINE(LIBSSH2_LIBGCRYPT, 1, [Use libgcrypt])
-fi
-AM_CONDITIONAL(LIBGCRYPT, test "$ac_cv_libgcrypt" = "yes")
-
-# Not all OpenSSL have AES-CTR functions.
-if test "$ac_cv_libssl" = "yes"; then
-  save_LDFLAGS="$LDFLAGS"
-  LDFLAGS="$LDFLAGS $LIBSSL"
-  AC_CHECK_FUNCS(EVP_aes_128_ctr)
-  LDFLAGS="$save_LDFLAGS"
-fi
-
-# Look for Libz
-if test "$use_libz" != "no"; then
-  AC_LIB_HAVE_LINKFLAGS([z], [], [#include <zlib.h>])
-  if test "$ac_cv_libz" != yes; then
-    AC_MSG_NOTICE([Cannot find libz, disabling compression])
-    AC_MSG_NOTICE([Try --with-libz-prefix=PATH if you know you have it])
-  else
-    AC_DEFINE(LIBSSH2_HAVE_ZLIB, 1, [Compile in zlib support])
-  fi
-fi
 
 #
 # Optional Settings
@@ -154,6 +181,30 @@ if test "$GEX_NEW" != "no"; then
   AC_DEFINE(LIBSSH2_DH_GEX_NEW, 1, [Enable newer diffie-hellman-group-exchange-sha1 syntax])
 fi
 
+AC_ARG_ENABLE(clear-memory,
+  AC_HELP_STRING([--disable-clear-memory],[Disable clearing of memory before being freed]),
+  [CLEAR_MEMORY=$enableval])
+if test "$CLEAR_MEMORY" != "no"; then
+  if test "$support_clear_memory" = "yes"; then
+    AC_DEFINE(LIBSSH2_CLEAR_MEMORY, 1, [Enable clearing of memory before being freed])
+    enable_clear_memory=yes
+  else
+    if test "$CLEAR_MEMORY" = "yes"; then
+      AC_MSG_ERROR([secure clearing/zeroing of memory is not supported by the selected crypto backend])
+    else
+      AC_MSG_WARN([secure clearing/zeroing of memory is not supported by the selected crypto backend])
+    fi
+    enable_clear_memory=unsupported
+  fi
+else
+  if test "$support_clear_memory" = "yes"; then
+    enable_clear_memory=no
+  else
+    AC_MSG_WARN([secure clearing/zeroing of memory is not supported by the selected crypto backend])
+    enable_clear_memory=unsupported
+  fi
+fi
+
 dnl ************************************************************
 dnl option to switch on compiler debug options
 dnl
@@ -164,6 +215,7 @@ AC_HELP_STRING([--disable-debug],[Disable debug options]),
 [ case "$enable_debug" in
   no)
        AC_MSG_RESULT(no)
+       CPPFLAGS="$CPPFLAGS -DNDEBUG"
        ;;
   *)   AC_MSG_RESULT(yes)
     enable_debug=yes
@@ -302,6 +354,22 @@ AC_C_INLINE
 
 CURL_CHECK_NONBLOCKING_SOCKET
 
+missing_required_deps=0
+
+if test "${libz_errors}" != ""; then
+  AS_MESSAGE([ERROR: ${libz_errors}])
+  missing_required_deps=1
+fi
+
+if test "$found_crypto" = "none"; then
+  AS_MESSAGE([ERROR: ${crypto_errors}])
+  missing_required_deps=1
+fi
+
+if test $missing_required_deps = 1; then
+  AC_MSG_ERROR([Required dependencies are missing!])
+fi
+
 AC_CONFIG_FILES([Makefile
                  src/Makefile
                  tests/Makefile
@@ -318,9 +386,10 @@ AC_MSG_NOTICE([summary of build options:
   Compiler:         ${CC}
   Compiler flags:   ${CFLAGS}
   Library types:    Shared=${enable_shared}, Static=${enable_static}
-  Crypto library:   openssl: ${ac_cv_libssl:-no} (AES-CTR: ${ac_cv_func_EVP_aes_128_ctr:-N/A}) libgcrypt: ${ac_cv_libgcrypt:-no}
+  Crypto library:   ${found_crypto_str}
+  Clear memory:     $enable_clear_memory
   Debug build:      $enable_debug
   Build examples:   $build_examples
   Path to sshd:     $ac_cv_path_SSHD (only for self-tests)
-  libz compression: $ac_cv_libz
+  zlib compression: ${found_libz}
 ])
